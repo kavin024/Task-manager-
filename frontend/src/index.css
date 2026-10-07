@@ -1,0 +1,124 @@
+/* ========================================
+   NEXUS - Main Entry Point
+   ======================================== */
+
+/* Legacy compatibility - superseded by styles/components.css */
+.app {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+.container {
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-6);
+  box-shadow: var(--shadow-md);
+}
+
+.controls {
+  margin-bottom: var(--space-6);
+  padding-bottom: var(--space-4);
+  border-bottom: 1px solid var(--surface-border);
+}
+
+.filters button {
+  padding: var(--space-1) var(--space-3);
+  margin-right: var(--space-2);
+  border: 1px solid var(--surface-border);
+  background: var(--surface);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  font-size: var(--text-sm);
+  transition: all var(--transition-fast);
+}
+
+.filters button.active {
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+  background: var(--accent-glow);
+}
+
+/*
+ * .form-card typography / controls are owned by styles/components.css.
+ * Only the small helpers below are kept here so legacy markup still reads well.
+ */
+.error {
+  color: var(--danger);
+  margin: var(--space-2) 0;
+  font-size: var(--text-sm);
+}
+
+.empty-state {
+  text-align: center;
+  padding: var(--space-8) var(--space-4);
+  color: var(--text-tertiary);
+}
+
+.dashboard-summary {
+  background: var(--bg-tertiary);
+  padding: var(--space-4) var(--space-5);
+  border-radius: var(--radius-lg);
+  margin-bottom: var(--space-6);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border: 1px solid var(--surface-border);
+}
+
+.summary-numbers {
+  display: flex;
+  gap: var(--space-6);
+}
+
+.summary-numbers div {
+  text-align: right;
+}
+
+.summary-numbers div span {
+  font-size: var(--text-2xl);
+  font-weight: var(--font-bold);
+  color: var(--text-primary);
+}
+
+.summary-numbers div p {
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .container {
+    margin: var(--space-2);
+    padding: var(--space-4);
+  }
+  
+  .filters {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+  }
+  
+  .filters button {
+    margin: var(--space-1) 0;
+  }
+  
+  .dashboard-summary {
+    flex-direction: column;
+    gap: var(--space-4);
+  }
+  
+  .summary-numbers {
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+  
+  .form-actions {
+    flex-wrap: wrap;
+  }
+  
+  .modal {
+    width: 95%;
+  }
+}
