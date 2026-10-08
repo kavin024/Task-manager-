@@ -1,8 +1,7 @@
 -- Migration: Create focus_sessions table
+-- The active database is selected by DB_NAME in database.py - no USE statement.
 
-USE student_task_manager;
-
-CREATE TABLE focus_sessions (
+CREATE TABLE IF NOT EXISTS focus_sessions (
     id INT AUTO_INCREMENT PRIMARY KEY,
     task_id INT NULL,
     duration_minutes INT NOT NULL,

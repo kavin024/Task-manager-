@@ -1,15 +1,14 @@
 -- Migration: Create tags and task_tags tables
+-- The active database is selected by DB_NAME in database.py - no USE statement.
 
-USE student_task_manager;
-
-CREATE TABLE tags (
+CREATE TABLE IF NOT EXISTS tags (
     id INT AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(50) NOT NULL UNIQUE,
     color VARCHAR(7) DEFAULT '#64748b',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE task_tags (
+CREATE TABLE IF NOT EXISTS task_tags (
     task_id INT NOT NULL,
     tag_id INT NOT NULL,
     PRIMARY KEY (task_id, tag_id),

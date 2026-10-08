@@ -1,7 +1,6 @@
 -- Migration: Add priority, due_date, project_id, completed_at, estimated_minutes to tasks
--- Run this after the initial tasks table exists
-
-USE student_task_manager;
+-- Run this after the initial tasks table exists (000_create_tasks.sql)
+-- The active database is selected by DB_NAME in database.py - no USE statement.
 
 -- Add new columns to tasks table
 ALTER TABLE tasks 

@@ -1,8 +1,7 @@
 -- Migration: Create projects table
+-- The active database is selected by DB_NAME in database.py - no USE statement.
 
-USE student_task_manager;
-
-CREATE TABLE projects (
+CREATE TABLE IF NOT EXISTS projects (
     id INT AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
     description TEXT,

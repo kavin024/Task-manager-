@@ -1,8 +1,7 @@
 -- Migration: Create subtasks table
+-- The active database is selected by DB_NAME in database.py - no USE statement.
 
-USE student_task_manager;
-
-CREATE TABLE subtasks (
+CREATE TABLE IF NOT EXISTS subtasks (
     id INT AUTO_INCREMENT PRIMARY KEY,
     task_id INT NOT NULL,
     title VARCHAR(255) NOT NULL,

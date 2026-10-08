@@ -1,8 +1,7 @@
 -- Migration: Create notes table
+-- The active database is selected by DB_NAME in database.py - no USE statement.
 
-USE student_task_manager;
-
-CREATE TABLE notes (
+CREATE TABLE IF NOT EXISTS notes (
     id INT AUTO_INCREMENT PRIMARY KEY,
     title VARCHAR(255) NOT NULL,
     content TEXT,
