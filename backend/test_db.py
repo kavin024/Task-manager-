@@ -1,14 +1,15 @@
-from database import get_connection
+import database
+import test_safety  # noqa: F401  (refuses to run against the production database)
 
 try:
-    conn = get_connection()
+    conn = database.get_connection()
     print('MySQL connection: OK')
     cursor = conn.cursor()
     cursor.execute('SELECT 1')
     cursor.fetchall()  # consume result
-    cursor.execute('SELECT * FROM student_task_manager.tasks')
+    cursor.execute('SELECT * FROM %s.tasks' % database.DB_NAME)
     tasks = cursor.fetchall()
-    print('Tasks in DB:', len(tasks))
+    print('Tasks in DB (%s):' % database.DB_NAME, len(tasks))
     for t in tasks:
         print('  -', t)
     cursor.close()

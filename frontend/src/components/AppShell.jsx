@@ -5,7 +5,7 @@ import { useTheme } from '../context/ThemeContext';
 
 const MOBILE_BREAKPOINT = 1024;
 
-export function AppShell({ children, currentPage = 'dashboard', onNavigate, mainRef, onOpenSearch }) {
+export function AppShell({ children, currentPage = 'dashboard', onNavigate, mainRef, onOpenSearch, user = null, onLogout }) {
   const [isMobile, setIsMobile] = useState(
     () => typeof window !== 'undefined' && window.innerWidth < MOBILE_BREAKPOINT
   );
@@ -42,6 +42,7 @@ export function AppShell({ children, currentPage = 'dashboard', onNavigate, main
         onClose={() => setSidebarOpen(false)}
         onNavigate={onNavigate}
         currentPage={currentPage}
+        user={user}
       />
 
       {isMobile && sidebarOpen && (
@@ -54,6 +55,8 @@ export function AppShell({ children, currentPage = 'dashboard', onNavigate, main
           onMenuClick={() => setSidebarOpen((open) => !open)}
           onOpenSearch={onOpenSearch}
           onNavigate={onNavigate}
+          user={user}
+          onLogout={onLogout}
         />
 
         <main className="main-content" role="main" ref={mainRef}>

@@ -1,13 +1,100 @@
 import axios from "axios"
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:5000/api"
+const TOKEN_KEY = "nexus-token"
+
+/** Read the raw bearer token from localStorage (safe in private mode). */
+export function getToken() {
+  try {
+    return localStorage.getItem(TOKEN_KEY)
+  } catch {
+    return null
+  }
+}
+
+/** Persist or clear the raw bearer token. */
+export function setToken(token) {
+  try {
+    if (token) localStorage.setItem(TOKEN_KEY, token)
+    else localStorage.removeItem(TOKEN_KEY)
+  } catch {
+    /* storage unavailable - session simply won't survive a reload */
+  }
+}
 
 const client = axios.create({ baseURL: API_BASE_URL })
+
+// Attach the bearer token to every request.
+client.interceptors.request.use((config) => {
+  const token = getToken()
+  if (token) {
+    config.headers = config.headers || {}
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
+})
+
+// A stale/expired token is a 401 on a request that carried a token. Let the
+// auth layer sign the user out; a 401 from /auth/login (no token) is ignored.
+let unauthorizedHandler = null
+export function setUnauthorizedHandler(handler) {
+  unauthorizedHandler = handler
+}
+
+client.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error?.response?.status === 401 && getToken() && unauthorizedHandler) {
+      unauthorizedHandler()
+    }
+    return Promise.reject(error)
+  }
+)
 
 export const API = {
   // Health
   health: async () => {
     const response = await client.get("/health")
+    return response.data
+  },
+
+  // Auth
+  register: async (payload) => {
+    const response = await client.post("/auth/register", payload)
+    return response.data
+  },
+
+  login: async (payload) => {
+    const response = await client.post("/auth/login", payload)
+    return response.data
+  },
+
+  logout: async () => {
+    try {
+      const response = await client.post("/auth/logout")
+      return response.data
+    } finally {
+      setToken(null)
+    }
+  },
+
+  me: async () => {
+    const response = await client.get("/auth/me")
+    return response.data
+  },
+
+  getPreferences: async () => {
+    const response = await client.get("/auth/preferences")
+    return response.data
+  },
+
+  updatePreferences: async (preferences) => {
+    const response = await client.put("/auth/preferences", preferences)
+    return response.data
+  },
+
+  getReminderHistory: async (params = {}) => {
+    const response = await client.get("/reminders/history", { params })
     return response.data
   },
 
