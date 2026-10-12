@@ -3,3 +3,4 @@ Flask-CORS
 mysql-connector-python
 python-dotenv
 gunicorn
+tzdata

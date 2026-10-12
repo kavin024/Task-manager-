@@ -1,0 +1,61 @@
+name: Daily task reminders
+
+on:
+  schedule:
+    # 00:30 UTC = 06:00 Asia/Kolkata (IST, UTC+5:30).
+    # GitHub Actions cron is UTC and can be delayed a few minutes at peak times.
+    - cron: "30 0 * * *"
+  # Allows running the job on demand from the Actions tab.
+  workflow_dispatch: {}
+
+# Never let two reminder runs overlap. A queued run waits for the current one
+# (cancel-in-progress: false) so a send is never interrupted halfway, and the
+# backend's own job lock rejects any run that still arrives concurrently.
+concurrency:
+  group: daily-reminders
+  cancel-in-progress: false
+
+jobs:
+  send-reminders:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger the reminder endpoint
+        env:
+          # Reuses the same API URL the frontend is built with.
+          API_URL: ${{ secrets.VITE_API_URL }}
+          # Shared secret agreed with the Flask app's REMINDER_JOB_TOKEN env var.
+          REMINDER_JOB_TOKEN: ${{ secrets.REMINDER_JOB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${REMINDER_JOB_TOKEN:-}" ]; then
+            echo "::error::REMINDER_JOB_TOKEN secret is not set. Add it in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+          # Fall back to the known production API base if the secret is absent.
+          API_URL="${API_URL:-https://task-manager-api-36uz.onrender.com/api}"
+
+          HTTP_CODE=$(curl -sS \
+            --retry 2 --retry-delay 10 --max-time 120 \
+            -o /tmp/response.json \
+            -w "%{http_code}" \
+            -X POST "$API_URL/internal/send-daily-reminders" \
+            -H "X-Reminder-Token: $REMINDER_JOB_TOKEN" \
+            -H "Content-Type: application/json")
+
+          echo "HTTP $HTTP_CODE"
+
+          # Log only safe aggregate counts. Never print the raw response body,
+          # recipient addresses, credentials, or SMTP error details.
+          if command -v jq >/dev/null 2>&1; then
+            jq -c '{ok, locked, processed, sent, skipped_already_sent, skipped_empty, failed}' \
+              /tmp/response.json 2>/dev/null || echo "Result: (response was not valid JSON)"
+          else
+            echo "Result: (jq unavailable; aggregate counts not shown)"
+          fi
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Reminder job failed with HTTP $HTTP_CODE"
+            exit 1
+          fi

@@ -10,12 +10,20 @@ from mysql.connector import Error
 
 MIGRATIONS_DIR = Path(__file__).parent / "database" / "migrations"
 
-# Errors that mean "this object already exists" - safe to skip, never destructive.
+# Errors that unambiguously mean "this object already exists", i.e. a previous
+# run created it but the migration was not recorded. Skipping these is safe and
+# never destructive. Deliberately NOT included:
+#   1022 / 1062  duplicate-key DATA conflicts (could mean real duplicate rows)
+#   1064         SQL syntax error
+#   1146 / 1054  missing table / column (schema drift, must be investigated)
+#   1452         FK constraint fails (bad data reference)
+# Anything outside this whitelist aborts the run instead of being ignored.
 ALREADY_EXISTS_ERRORS = {
     1050,  # table already exists
     1060,  # duplicate column name
     1061,  # duplicate key name (index)
-    1022,  # duplicate key
+    1091,  # can't DROP (column/key does not exist) - idempotent drops
+    1826,  # duplicate foreign key constraint name
 }
 
 
@@ -88,6 +96,7 @@ def run_migrations():
 
         # Split by semicolon and execute each statement
         statements = [s.strip() for s in sql.split(';') if s.strip()]
+        skipped = []
         for stmt in statements:
             if not stmt or is_comment_only(stmt):
                 continue
@@ -95,15 +104,26 @@ def run_migrations():
                 cursor.execute(stmt)
             except Error as e:
                 if e.errno in ALREADY_EXISTS_ERRORS:
-                    print(f"  [SKIP] already exists: {e.msg}")
+                    first_line = stmt.strip().splitlines()[0][:70]
+                    print(f"  [SKIP] object already exists ({e.errno}): {first_line}")
+                    skipped.append(e.errno)
                     continue
-                print(f"  [ERROR] {stmt[:80]}...")
+                # Anything else is a real problem: abort instead of recording
+                # this migration as successfully applied.
+                print(f"  [ERROR] errno {e.errno}: {e.msg}")
+                print(f"  [ERROR] statement: {stmt[:200]}")
                 raise
 
         # Record migration
         cursor.execute("INSERT INTO migrations (filename) VALUES (%s)", (migration_file.name,))
         conn.commit()
-        print(f"  [OK] Applied {migration_file.name}")
+        if skipped:
+            print(
+                f"  [OK] Applied {migration_file.name} "
+                f"({len(skipped)} statement(s) already present, nothing destructive)"
+            )
+        else:
+            print(f"  [OK] Applied {migration_file.name}")
 
     print()
     print("Current tables:")

@@ -1,15 +1,41 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from flask.json.provider import DefaultJSONProvider
 from flask_cors import CORS
 from database import get_connection
 import json
 import os
 import re
+import hmac
 from datetime import datetime, date, timedelta
 from decimal import Decimal
 
+from auth import (
+    require_auth,
+    create_session,
+    revoke_session,
+    hash_password,
+    verify_password,
+    normalize_email,
+)
+import reminders
+
 app = Flask(__name__)
-CORS(app)
+
+# Cross-origin authentication uses bearer tokens (not cookies), so no
+# credentials are shared across origins. Only the real frontends are allowed.
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.getenv(
+        "CORS_ORIGINS",
+        "https://kavin024.github.io,http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if o.strip()
+]
+CORS(
+    app,
+    resources={r"/api/*": {"origins": ALLOWED_ORIGINS}},
+    allow_headers=["Content-Type", "Authorization"],
+)
 
 
 class NexusJSONProvider(DefaultJSONProvider):
@@ -70,6 +96,40 @@ def normalize_project_id(value):
     return parsed
 
 
+def validate_email(raw):
+    """Return a normalized email or None when invalid."""
+    email = normalize_email(raw)
+    if not email or len(email) > 255:
+        return None
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        return None
+    return email
+
+
+def validate_timezone(raw):
+    """Return a valid IANA timezone name or None."""
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    value = (raw or "").strip() or "Asia/Kolkata"
+    try:
+        ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+    return value
+
+
+def validate_remind_time(raw):
+    """Return a normalized HH:MM:SS 24h value or None."""
+    value = (raw or "").strip()
+    match = re.match(r"^([01]?\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?$", value)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    second = int(match.group(3)) if match.group(3) else 0
+    return f"{hour:02d}:{minute:02d}:{second:02d}"
+
+
 def validate_task_data(data, is_update=False):
     """Validate task data"""
     errors = {}
@@ -113,17 +173,17 @@ def validate_task_data(data, is_update=False):
     return errors if errors else None
 
 
-def project_exists(cursor, project_id):
+def project_exists(cursor, project_id, user_id):
     if not project_id:
         return True
-    cursor.execute("SELECT id FROM projects WHERE id = %s", (project_id,))
+    cursor.execute("SELECT id FROM projects WHERE id = %s AND user_id = %s", (project_id, user_id))
     return cursor.fetchone() is not None
 
 
-def task_exists(cursor, task_id):
+def task_exists(cursor, task_id, user_id):
     if not task_id:
         return True
-    cursor.execute("SELECT id FROM tasks WHERE id = %s", (task_id,))
+    cursor.execute("SELECT id FROM tasks WHERE id = %s AND user_id = %s", (task_id, user_id))
     return cursor.fetchone() is not None
 
 
@@ -182,9 +242,9 @@ def attach_task_relations(cursor, tasks):
         task["tags"] = tag_rows.get(task["id"], [])
     return tasks
 
-def get_task_with_relations(cursor, task_id):
+def get_task_with_relations(cursor, task_id, user_id):
     """Get task with subtasks, tags, and project"""
-    cursor.execute("SELECT * FROM tasks WHERE id = %s", (task_id,))
+    cursor.execute("SELECT * FROM tasks WHERE id = %s AND user_id = %s", (task_id, user_id))
     task = cursor.fetchone()
     if not task:
         return None
@@ -205,7 +265,7 @@ def get_task_with_relations(cursor, task_id):
     
     # Get project
     if task.get("project_id"):
-        cursor.execute("SELECT * FROM projects WHERE id = %s", (task["project_id"],))
+        cursor.execute("SELECT * FROM projects WHERE id = %s AND user_id = %s", (task["project_id"], user_id))
         task["project"] = cursor.fetchone()
     
     return task
@@ -224,6 +284,7 @@ def health_check():
         return jsonify({"status": "error", "database": "disconnected"}), 500
 
 @app.route("/api/tasks", methods=["GET"])
+@require_auth
 def get_tasks():
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
@@ -231,18 +292,20 @@ def get_tasks():
         SELECT t.*, p.name AS project_name, p.color AS project_color
         FROM tasks t
         LEFT JOIN projects p ON p.id = t.project_id
+        WHERE t.user_id = %s
         ORDER BY t.created_at DESC, t.id DESC
-    """)
+    """, (g.user_id,))
     tasks = attach_task_relations(cursor, cursor.fetchall())
     cursor.close()
     conn.close()
     return jsonify(tasks), 200
 
 @app.route("/api/tasks/<int:task_id>", methods=["GET"])
+@require_auth
 def get_task(task_id):
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    task = get_task_with_relations(cursor, task_id)
+    task = get_task_with_relations(cursor, task_id, g.user_id)
     cursor.close()
     conn.close()
     if task is None:
@@ -250,6 +313,7 @@ def get_task(task_id):
     return jsonify(task), 200
 
 @app.route("/api/tasks", methods=["POST"])
+@require_auth
 def create_task():
     data = request.get_json()
     if not data:
@@ -269,25 +333,26 @@ def create_task():
 
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    if not project_exists(cursor, project_id):
+    if not project_exists(cursor, project_id, g.user_id):
         cursor.close()
         conn.close()
         return jsonify({"error": "Project not found"}), 404
 
     cursor.execute(
-        """INSERT INTO tasks (title, description, status, priority, due_date, project_id, estimated_minutes, completed_at)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, IF(%s = 'Completed', NOW(), NULL))""",
-        (title, description, status, priority, due_date, project_id, estimated_minutes, status),
+        """INSERT INTO tasks (title, description, status, priority, due_date, project_id, estimated_minutes, completed_at, user_id)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, IF(%s = 'Completed', NOW(), NULL), %s)""",
+        (title, description, status, priority, due_date, project_id, estimated_minutes, status, g.user_id),
     )
     conn.commit()
     task_id = cursor.lastrowid
-    task = get_task_with_relations(cursor, task_id)
+    task = get_task_with_relations(cursor, task_id, g.user_id)
     cursor.close()
     conn.close()
     log_activity(task_id, project_id, "created", f'Task "{title}" created', {"status": status})
     return jsonify(task), 201
 
 @app.route("/api/tasks/<int:task_id>", methods=["PUT"])
+@require_auth
 def update_task(task_id):
     data = request.get_json()
     if not data:
@@ -299,7 +364,7 @@ def update_task(task_id):
     
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM tasks WHERE id = %s", (task_id,))
+    cursor.execute("SELECT * FROM tasks WHERE id = %s AND user_id = %s", (task_id, g.user_id))
     if cursor.fetchone() is None:
         cursor.close()
         conn.close()
@@ -326,7 +391,7 @@ def update_task(task_id):
         values.append(data["due_date"] or None)
     if "project_id" in data:
         project_id = normalize_project_id(data["project_id"])
-        if not project_exists(cursor, project_id):
+        if not project_exists(cursor, project_id, g.user_id):
             cursor.close()
             conn.close()
             return jsonify({"error": "Project not found"}), 404
@@ -347,7 +412,7 @@ def update_task(task_id):
         cursor.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id = %s", values)
         conn.commit()
     
-    task = get_task_with_relations(cursor, task_id)
+    task = get_task_with_relations(cursor, task_id, g.user_id)
     cursor.close()
     conn.close()
     action = "completed" if data.get("status") == "Completed" else "updated"
@@ -356,10 +421,11 @@ def update_task(task_id):
     return jsonify(task), 200
 
 @app.route("/api/tasks/<int:task_id>", methods=["DELETE"])
+@require_auth
 def delete_task(task_id):
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT id, title, project_id FROM tasks WHERE id = %s", (task_id,))
+    cursor.execute("SELECT id, title, project_id FROM tasks WHERE id = %s AND user_id = %s", (task_id, g.user_id))
     task = cursor.fetchone()
     if task is None:
         cursor.close()
@@ -407,10 +473,11 @@ def decorate_project(project):
 
 
 @app.route("/api/projects", methods=["GET"])
+@require_auth
 def get_projects():
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute(PROJECT_SELECT.format(where=""))
+    cursor.execute(PROJECT_SELECT.format(where="WHERE p.user_id = %s"), (g.user_id,))
     projects = [decorate_project(p) for p in cursor.fetchall()]
     cursor.close()
     conn.close()
@@ -418,10 +485,11 @@ def get_projects():
 
 
 @app.route("/api/projects/<int:project_id>", methods=["GET"])
+@require_auth
 def get_project(project_id):
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute(PROJECT_SELECT.format(where="WHERE p.id = %s"), (project_id,))
+    cursor.execute(PROJECT_SELECT.format(where="WHERE p.id = %s AND p.user_id = %s"), (project_id, g.user_id))
     project = cursor.fetchone()
     if project is None:
         cursor.close()
@@ -458,7 +526,7 @@ def load_project(conn, project_id, cursor=None):
     own_cursor = cursor is None
     if own_cursor:
         cursor = conn.cursor(dictionary=True)
-    cursor.execute(PROJECT_SELECT.format(where="WHERE p.id = %s"), (project_id,))
+    cursor.execute(PROJECT_SELECT.format(where="WHERE p.id = %s AND p.user_id = %s"), (project_id, g.user_id))
     project = cursor.fetchone()
     if own_cursor:
         cursor.close()
@@ -466,6 +534,7 @@ def load_project(conn, project_id, cursor=None):
 
 
 @app.route("/api/projects", methods=["POST"])
+@require_auth
 def create_project():
     data = request.get_json()
     if not data:
@@ -482,8 +551,8 @@ def create_project():
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
     cursor.execute(
-        "INSERT INTO projects (name, description, color) VALUES (%s, %s, %s)",
-        (name, description, color),
+        "INSERT INTO projects (name, description, color, user_id) VALUES (%s, %s, %s, %s)",
+        (name, description, color, g.user_id),
     )
     conn.commit()
     project_id = cursor.lastrowid
@@ -495,6 +564,7 @@ def create_project():
 
 
 @app.route("/api/projects/<int:project_id>", methods=["PUT"])
+@require_auth
 def update_project(project_id):
     data = request.get_json()
     if not data:
@@ -506,7 +576,7 @@ def update_project(project_id):
 
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT id FROM projects WHERE id = %s", (project_id,))
+    cursor.execute("SELECT id FROM projects WHERE id = %s AND user_id = %s", (project_id, g.user_id))
     if cursor.fetchone() is None:
         cursor.close()
         conn.close()
@@ -539,10 +609,11 @@ def update_project(project_id):
 
 
 @app.route("/api/projects/<int:project_id>", methods=["DELETE"])
+@require_auth
 def delete_project(project_id):
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT id, name FROM projects WHERE id = %s", (project_id,))
+    cursor.execute("SELECT id, name FROM projects WHERE id = %s AND user_id = %s", (project_id, g.user_id))
     project = cursor.fetchone()
     if project is None:
         cursor.close()
@@ -562,16 +633,22 @@ def delete_project(project_id):
 # ==================== SUBTASKS ====================
 
 @app.route("/api/tasks/<int:task_id>/subtasks", methods=["GET"])
+@require_auth
 def get_subtasks(task_id):
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM subtasks WHERE task_id = %s ORDER BY created_at", (task_id,))
+    if not task_exists(cursor, task_id, g.user_id):
+        cursor.close()
+        conn.close()
+        return jsonify({"error": "Task not found"}), 404
+    cursor.execute("SELECT s.* FROM subtasks s JOIN tasks t ON t.id = s.task_id WHERE s.task_id = %s AND t.user_id = %s ORDER BY s.created_at", (task_id, g.user_id))
     subtasks = cursor.fetchall()
     cursor.close()
     conn.close()
     return jsonify(subtasks), 200
 
 @app.route("/api/tasks/<int:task_id>/subtasks", methods=["POST"])
+@require_auth
 def create_subtask(task_id):
     data = request.get_json()
     if not data or not data.get("title"):
@@ -579,7 +656,7 @@ def create_subtask(task_id):
     
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM tasks WHERE id = %s", (task_id,))
+    cursor.execute("SELECT id FROM tasks WHERE id = %s AND user_id = %s", (task_id, g.user_id))
     if cursor.fetchone() is None:
         cursor.close()
         conn.close()
@@ -599,6 +676,7 @@ def create_subtask(task_id):
     return jsonify(subtask), 201
 
 @app.route("/api/subtasks/<int:subtask_id>", methods=["PUT"])
+@require_auth
 def update_subtask(subtask_id):
     data = request.get_json()
     if not data:
@@ -606,7 +684,7 @@ def update_subtask(subtask_id):
     
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM subtasks WHERE id = %s", (subtask_id,))
+    cursor.execute("SELECT s.* FROM subtasks s JOIN tasks t ON t.id = s.task_id WHERE s.id = %s AND t.user_id = %s", (subtask_id, g.user_id))
     if cursor.fetchone() is None:
         cursor.close()
         conn.close()
@@ -634,10 +712,11 @@ def update_subtask(subtask_id):
     return jsonify(subtask), 200
 
 @app.route("/api/subtasks/<int:subtask_id>", methods=["DELETE"])
+@require_auth
 def delete_subtask(subtask_id):
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM subtasks WHERE id = %s", (subtask_id,))
+    cursor.execute("SELECT s.id FROM subtasks s JOIN tasks t ON t.id = s.task_id WHERE s.id = %s AND t.user_id = %s", (subtask_id, g.user_id))
     if cursor.fetchone() is None:
         cursor.close()
         conn.close()
@@ -652,16 +731,18 @@ def delete_subtask(subtask_id):
 # ==================== TAGS ====================
 
 @app.route("/api/tags", methods=["GET"])
+@require_auth
 def get_tags():
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM tags ORDER BY name")
+    cursor.execute("SELECT * FROM tags WHERE user_id = %s ORDER BY name", (g.user_id,))
     tags = cursor.fetchall()
     cursor.close()
     conn.close()
     return jsonify(tags), 200
 
 @app.route("/api/tags", methods=["POST"])
+@require_auth
 def create_tag():
     data = request.get_json()
     if not data or not data.get("name"):
@@ -679,12 +760,12 @@ def create_tag():
     cursor = conn.cursor(dictionary=True)
     try:
         cursor.execute(
-            "INSERT INTO tags (name, color) VALUES (%s, %s)",
-            (name, color)
+            "INSERT INTO tags (name, color, user_id) VALUES (%s, %s, %s)",
+            (name, color, g.user_id)
         )
         conn.commit()
         tag_id = cursor.lastrowid
-        cursor.execute("SELECT * FROM tags WHERE id = %s", (tag_id,))
+        cursor.execute("SELECT * FROM tags WHERE id = %s AND user_id = %s", (tag_id, g.user_id))
         tag = cursor.fetchone()
         cursor.close()
         conn.close()
@@ -695,6 +776,7 @@ def create_tag():
         raise
 
 @app.route("/api/tasks/<int:task_id>/tags", methods=["POST"])
+@require_auth
 def add_tag_to_task(task_id):
     data = request.get_json()
     if not data or not data.get("tag_id"):
@@ -702,13 +784,13 @@ def add_tag_to_task(task_id):
     
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM tasks WHERE id = %s", (task_id,))
+    cursor.execute("SELECT id FROM tasks WHERE id = %s AND user_id = %s", (task_id, g.user_id))
     if cursor.fetchone() is None:
         cursor.close()
         conn.close()
         return jsonify({"error": "Task not found"}), 404
     
-    cursor.execute("SELECT * FROM tags WHERE id = %s", (data["tag_id"],))
+    cursor.execute("SELECT id FROM tags WHERE id = %s AND user_id = %s", (data["tag_id"], g.user_id))
     if cursor.fetchone() is None:
         cursor.close()
         conn.close()
@@ -730,10 +812,17 @@ def add_tag_to_task(task_id):
     return jsonify({"message": "Tag added to task"}), 201
 
 @app.route("/api/tasks/<int:task_id>/tags/<int:tag_id>", methods=["DELETE"])
+@require_auth
 def remove_tag_from_task(task_id, tag_id):
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM task_tags WHERE task_id = %s AND tag_id = %s", (task_id, tag_id))
+    cursor.execute("""
+        DELETE tt FROM task_tags tt
+        JOIN tasks t ON t.id = tt.task_id
+        JOIN tags g ON g.id = tt.tag_id
+        WHERE tt.task_id = %s AND tt.tag_id = %s
+          AND t.user_id = %s AND g.user_id = %s
+    """, (task_id, tag_id, g.user_id, g.user_id))
     conn.commit()
     affected = cursor.rowcount
     cursor.close()
@@ -754,13 +843,14 @@ FOCUS_SESSION_SELECT = """
 
 
 @app.route("/api/focus/sessions", methods=["GET"])
+@require_auth
 def get_focus_sessions():
     limit = min(max(request.args.get("limit", 100, type=int) or 100, 1), 500)
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
     cursor.execute(
-        FOCUS_SESSION_SELECT.format(where="") + " LIMIT %s",
-        (limit,),
+        FOCUS_SESSION_SELECT.format(where="WHERE fs.user_id = %s") + " LIMIT %s",
+        (g.user_id, limit),
     )
     sessions = cursor.fetchall()
     cursor.close()
@@ -769,6 +859,7 @@ def get_focus_sessions():
 
 
 @app.route("/api/focus/sessions", methods=["POST"])
+@require_auth
 def create_focus_session():
     data = request.get_json()
     if not data or not data.get("duration_minutes"):
@@ -786,7 +877,7 @@ def create_focus_session():
 
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    if not task_exists(cursor, task_id):
+    if not task_exists(cursor, task_id, g.user_id):
         cursor.close()
         conn.close()
         return jsonify({"error": "Task not found"}), 404
@@ -794,15 +885,15 @@ def create_focus_session():
     # NOW() is evaluated by MySQL so timestamps stay aligned with the
     # CURDATE() based day/week bucketing used by /api/focus/stats.
     cursor.execute(
-        """INSERT INTO focus_sessions (task_id, duration_minutes, started_at, ended_at, completed)
-           VALUES (%s, %s, NOW(), IF(%s, NOW(), NULL), %s)""",
-        (task_id, duration, completed, completed),
+        """INSERT INTO focus_sessions (task_id, duration_minutes, started_at, ended_at, completed, user_id)
+           VALUES (%s, %s, NOW(), IF(%s, NOW(), NULL), %s, %s)""",
+        (task_id, duration, completed, completed, g.user_id),
     )
     conn.commit()
     session_id = cursor.lastrowid
     cursor.execute(
-        FOCUS_SESSION_SELECT.format(where="WHERE fs.id = %s"),
-        (session_id,),
+        FOCUS_SESSION_SELECT.format(where="WHERE fs.id = %s AND fs.user_id = %s"),
+        (session_id, g.user_id),
     )
     session = cursor.fetchone()
     cursor.close()
@@ -811,6 +902,7 @@ def create_focus_session():
 
 
 @app.route("/api/focus/sessions/<int:session_id>", methods=["PUT"])
+@require_auth
 def update_focus_session(session_id):
     data = request.get_json()
     if not data:
@@ -818,7 +910,7 @@ def update_focus_session(session_id):
 
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT id FROM focus_sessions WHERE id = %s", (session_id,))
+    cursor.execute("SELECT id FROM focus_sessions WHERE id = %s AND user_id = %s", (session_id, g.user_id))
     if cursor.fetchone() is None:
         cursor.close()
         conn.close()
@@ -849,8 +941,8 @@ def update_focus_session(session_id):
         conn.commit()
 
     cursor.execute(
-        FOCUS_SESSION_SELECT.format(where="WHERE fs.id = %s"),
-        (session_id,),
+        FOCUS_SESSION_SELECT.format(where="WHERE fs.id = %s AND fs.user_id = %s"),
+        (session_id, g.user_id),
     )
     session = cursor.fetchone()
     cursor.close()
@@ -858,10 +950,11 @@ def update_focus_session(session_id):
     return jsonify(session), 200
 
 @app.route("/api/focus/sessions/<int:session_id>", methods=["DELETE"])
+@require_auth
 def delete_focus_session(session_id):
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM focus_sessions WHERE id = %s", (session_id,))
+    cursor.execute("SELECT * FROM focus_sessions WHERE id = %s AND user_id = %s", (session_id, g.user_id))
     if cursor.fetchone() is None:
         cursor.close()
         conn.close()
@@ -874,6 +967,7 @@ def delete_focus_session(session_id):
     return jsonify({"message": "Focus session deleted successfully"}), 200
 
 @app.route("/api/focus/stats", methods=["GET"])
+@require_auth
 def get_focus_stats():
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
@@ -885,7 +979,8 @@ def get_focus_stats():
             CAST(COALESCE(SUM(CASE WHEN completed = TRUE AND DATE(started_at) = CURDATE() THEN duration_minutes ELSE 0 END), 0) AS SIGNED) AS today_minutes,
             CAST(COALESCE(SUM(CASE WHEN completed = TRUE AND YEARWEEK(started_at, 1) = YEARWEEK(CURDATE(), 1) THEN duration_minutes ELSE 0 END), 0) AS SIGNED) AS week_minutes
         FROM focus_sessions
-    """)
+        WHERE user_id = %s
+    """, (g.user_id,))
     totals = cursor.fetchone()
 
     # Sessions by task
@@ -893,11 +988,11 @@ def get_focus_stats():
         SELECT t.title, CAST(COALESCE(SUM(fs.duration_minutes), 0) AS SIGNED) as minutes
         FROM focus_sessions fs
         LEFT JOIN tasks t ON fs.task_id = t.id
-        WHERE fs.completed = TRUE
+        WHERE fs.completed = TRUE AND fs.user_id = %s
         GROUP BY fs.task_id, t.title
         ORDER BY minutes DESC
         LIMIT 10
-    """)
+    """, (g.user_id,))
     by_task = cursor.fetchall()
 
     cursor.close()
@@ -962,6 +1057,7 @@ def bucket_key(day, granularity):
 
 
 @app.route("/api/analytics/overview", methods=["GET"])
+@require_auth
 def get_analytics_overview():
     range_key = resolve_range(request.args.get("range"))
     days = ANALYTICS_RANGES[range_key]
@@ -978,7 +1074,8 @@ def get_analytics_overview():
             CAST(COALESCE(SUM(status = 'Backlog'), 0) AS SIGNED) AS backlog,
             CAST(COALESCE(SUM(status = 'Archived'), 0) AS SIGNED) AS archived
         FROM tasks
-    """)
+        WHERE user_id = %s
+    """, (g.user_id,))
     totals = cursor.fetchone()
 
     total = int(totals["total"] or 0)
@@ -987,33 +1084,33 @@ def get_analytics_overview():
 
     cursor.execute("""
         SELECT status, CAST(COUNT(*) AS SIGNED) as count
-        FROM tasks GROUP BY status ORDER BY FIELD(status, 'Backlog','Pending','In Progress','Completed','Archived')
-    """)
+        FROM tasks WHERE user_id = %s GROUP BY status ORDER BY FIELD(status, 'Backlog','Pending','In Progress','Completed','Archived')
+    """, (g.user_id,))
     by_status = cursor.fetchall()
 
     cursor.execute("""
         SELECT priority, CAST(COUNT(*) AS SIGNED) as count
-        FROM tasks GROUP BY priority ORDER BY FIELD(priority, 'Critical','High','Medium','Low')
-    """)
+        FROM tasks WHERE user_id = %s GROUP BY priority ORDER BY FIELD(priority, 'Critical','High','Medium','Low')
+    """, (g.user_id,))
     by_priority = cursor.fetchall()
 
     cursor.execute("""
         SELECT CAST(COUNT(*) AS SIGNED) as count FROM tasks
-        WHERE due_date IS NOT NULL AND due_date < NOW() AND status NOT IN ('Completed', 'Archived')
-    """)
+        WHERE user_id = %s AND due_date IS NOT NULL AND due_date < NOW() AND status NOT IN ('Completed', 'Archived')
+    """, (g.user_id,))
     overdue = cursor.fetchone()
 
     cursor.execute("""
         SELECT CAST(COUNT(*) AS SIGNED) as count FROM tasks
-        WHERE YEARWEEK(created_at, 1) = YEARWEEK(CURDATE(), 1)
-    """)
+        WHERE user_id = %s AND YEARWEEK(created_at, 1) = YEARWEEK(CURDATE(), 1)
+    """, (g.user_id,))
     created_this_week = cursor.fetchone()
 
     cursor.execute("""
         SELECT CAST(COUNT(*) AS SIGNED) as count FROM tasks
-        WHERE status = 'Completed' AND completed_at IS NOT NULL
+        WHERE user_id = %s AND status = 'Completed' AND completed_at IS NOT NULL
           AND YEARWEEK(completed_at, 1) = YEARWEEK(CURDATE(), 1)
-    """)
+    """, (g.user_id,))
     completed_this_week = cursor.fetchone()
 
     # Range-scoped counters (days always comes from the ANALYTICS_RANGES whitelist)
@@ -1022,16 +1119,16 @@ def get_analytics_overview():
             CAST(COUNT(*) AS SIGNED) AS created,
             CAST(COALESCE(SUM(status = 'Completed'), 0) AS SIGNED) AS completed
         FROM tasks
-        WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
-    """, (days,))
+        WHERE user_id = %s AND created_at >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
+    """, (g.user_id, days))
     created_in_range = cursor.fetchone()
 
     cursor.execute("""
         SELECT CAST(COUNT(*) AS SIGNED) AS completed
         FROM tasks
-        WHERE status = 'Completed' AND completed_at IS NOT NULL
+        WHERE user_id = %s AND status = 'Completed' AND completed_at IS NOT NULL
           AND completed_at >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
-    """, (days,))
+    """, (g.user_id, days))
     completed_in_range = cursor.fetchone()
 
     cursor.close()
@@ -1065,6 +1162,7 @@ def get_analytics_overview():
 
 
 @app.route("/api/analytics/productivity", methods=["GET"])
+@require_auth
 def get_productivity_trends():
     range_key = resolve_range(request.args.get("range"))
     days = ANALYTICS_RANGES[range_key]
@@ -1076,18 +1174,18 @@ def get_productivity_trends():
     cursor.execute("""
         SELECT DATE(created_at) AS day, CAST(COUNT(*) AS SIGNED) AS count
         FROM tasks
-        WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
+        WHERE user_id = %s AND created_at >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
         GROUP BY DATE(created_at)
-    """, (days,))
+    """, (g.user_id, days))
     creation_rows = cursor.fetchall()
 
     cursor.execute("""
         SELECT DATE(completed_at) AS day, CAST(COUNT(*) AS SIGNED) AS count
         FROM tasks
-        WHERE status = 'Completed' AND completed_at IS NOT NULL
+        WHERE user_id = %s AND status = 'Completed' AND completed_at IS NOT NULL
           AND completed_at >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
         GROUP BY DATE(completed_at)
-    """, (days,))
+    """, (g.user_id, days))
     completion_rows = cursor.fetchall()
 
     cursor.execute("SELECT CURDATE() AS today")
@@ -1130,6 +1228,7 @@ def get_productivity_trends():
     }), 200
 
 @app.route("/api/analytics/projects", methods=["GET"])
+@require_auth
 def get_project_analytics():
     range_key = resolve_range(request.args.get("range"))
     days = ANALYTICS_RANGES[range_key]
@@ -1153,10 +1252,11 @@ def get_project_analytics():
             CAST(COALESCE(SUM(CASE WHEN t.status = 'Completed' AND t.completed_at IS NOT NULL
                                         AND t.completed_at >= DATE_SUB(CURDATE(), INTERVAL %s DAY) THEN 1 ELSE 0 END), 0) AS SIGNED) AS period_completed
         FROM projects p
-        LEFT JOIN tasks t ON p.id = t.project_id
+        LEFT JOIN tasks t ON p.id = t.project_id AND t.user_id = %s
+        WHERE p.user_id = %s
         GROUP BY p.id, p.name, p.color
         ORDER BY total_tasks DESC, p.name ASC
-    """, (days, days))
+    """, (days, days, g.user_id, g.user_id))
     projects = cursor.fetchall()
     cursor.close()
     conn.close()
@@ -1175,12 +1275,13 @@ def get_project_analytics():
 
 
 @app.route("/api/analytics/priority-distribution", methods=["GET"])
+@require_auth
 def get_priority_distribution():
     range_key = resolve_range(request.args.get("range"))
     days = ANALYTICS_RANGES[range_key]
     # Pass a "range" of "all" for lifetime data, otherwise filter by creation date.
     scoped = str(request.args.get("range") or "").strip().lower() != "all"
-    where = "WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL %s DAY)" if scoped else ""
+    where = "WHERE user_id = %s AND created_at >= DATE_SUB(CURDATE(), INTERVAL %s DAY)" if scoped else "WHERE user_id = %s"
 
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
@@ -1190,14 +1291,14 @@ def get_priority_distribution():
         FROM tasks {where}
         GROUP BY priority
         ORDER BY FIELD(priority, 'Critical','High','Medium','Low')
-    """, (days,) if scoped else ())
+    """, (g.user_id, days) if scoped else (g.user_id,))
     by_priority = cursor.fetchall()
 
     cursor.execute(f"""
         SELECT priority, status, CAST(COUNT(*) AS SIGNED) as count
         FROM tasks {where}
         GROUP BY priority, status
-    """, (days,) if scoped else ())
+    """, (g.user_id, days) if scoped else (g.user_id,))
     by_priority_status = cursor.fetchall()
 
     total = sum(int(row["count"]) for row in by_priority)
@@ -1216,6 +1317,7 @@ def get_priority_distribution():
 # ==================== NOTES ====================
 
 @app.route("/api/notes", methods=["GET"])
+@require_auth
 def get_notes():
     project_id = request.args.get("project_id", type=int)
     conn = get_connection()
@@ -1224,14 +1326,15 @@ def get_notes():
         cursor.execute("""
             SELECT n.*, p.name AS project_name, p.color AS project_color
             FROM notes n LEFT JOIN projects p ON p.id = n.project_id
-            WHERE n.project_id = %s ORDER BY n.updated_at DESC, n.id DESC
-        """, (project_id,))
+            WHERE n.user_id = %s AND n.project_id = %s ORDER BY n.updated_at DESC, n.id DESC
+        """, (g.user_id, project_id))
     else:
         cursor.execute("""
             SELECT n.*, p.name AS project_name, p.color AS project_color
             FROM notes n LEFT JOIN projects p ON p.id = n.project_id
+            WHERE n.user_id = %s
             ORDER BY n.updated_at DESC, n.id DESC
-        """)
+        """, (g.user_id,))
     notes = [decorate_note(row) for row in cursor.fetchall()]
     cursor.close()
     conn.close()
@@ -1253,14 +1356,15 @@ def decorate_note(note):
 
 
 @app.route("/api/notes/<int:note_id>", methods=["GET"])
+@require_auth
 def get_note(note_id):
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
     cursor.execute("""
         SELECT n.*, p.name AS project_name, p.color AS project_color
         FROM notes n LEFT JOIN projects p ON p.id = n.project_id
-        WHERE n.id = %s
-    """, (note_id,))
+        WHERE n.id = %s AND n.user_id = %s
+    """, (note_id, g.user_id))
     note = cursor.fetchone()
     cursor.close()
     conn.close()
@@ -1269,6 +1373,7 @@ def get_note(note_id):
     return jsonify(decorate_note(note)), 200
 
 @app.route("/api/notes", methods=["POST"])
+@require_auth
 def create_note():
     data = request.get_json()
     if not data or not data.get("title"):
@@ -1280,14 +1385,14 @@ def create_note():
 
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    if not project_exists(cursor, project_id):
+    if not project_exists(cursor, project_id, g.user_id):
         cursor.close()
         conn.close()
         return jsonify({"error": "Project not found"}), 404
 
     cursor.execute(
-        "INSERT INTO notes (title, content, project_id) VALUES (%s, %s, %s)",
-        (title, content, project_id)
+        "INSERT INTO notes (title, content, project_id, user_id) VALUES (%s, %s, %s, %s)",
+        (title, content, project_id, g.user_id)
     )
     conn.commit()
     note_id = cursor.lastrowid
@@ -1301,6 +1406,7 @@ def create_note():
     return jsonify(decorate_note(note)), 201
 
 @app.route("/api/notes/<int:note_id>", methods=["PUT"])
+@require_auth
 def update_note(note_id):
     data = request.get_json()
     if not data:
@@ -1308,7 +1414,7 @@ def update_note(note_id):
 
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT id FROM notes WHERE id = %s", (note_id,))
+    cursor.execute("SELECT id FROM notes WHERE id = %s AND user_id = %s", (note_id, g.user_id))
     if cursor.fetchone() is None:
         cursor.close()
         conn.close()
@@ -1334,12 +1440,14 @@ def update_note(note_id):
         values.append((data.get("content") or "").strip())
     if "project_id" in data:
         project_id = normalize_project_id(data["project_id"])
-        if not project_exists(cursor, project_id):
+        if not project_exists(cursor, project_id, g.user_id):
             cursor.close()
             conn.close()
             return jsonify({"error": "Project not found"}), 404
         fields.append("project_id = %s")
         values.append(project_id)
+
+    fields.append("updated_at = NOW()")
 
     if fields:
         values.append(note_id)
@@ -1356,10 +1464,11 @@ def update_note(note_id):
     return jsonify(decorate_note(note)), 200
 
 @app.route("/api/notes/<int:note_id>", methods=["DELETE"])
+@require_auth
 def delete_note(note_id):
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM notes WHERE id = %s", (note_id,))
+    cursor.execute("SELECT * FROM notes WHERE id = %s AND user_id = %s", (note_id, g.user_id))
     if cursor.fetchone() is None:
         cursor.close()
         conn.close()
@@ -1374,16 +1483,17 @@ def delete_note(note_id):
 # ==================== ACTIVITY LOGS ====================
 
 @app.route("/api/activity", methods=["GET"])
+@require_auth
 def get_activity_logs():
-    limit = request.args.get("limit", 50, type=int)
+    limit = min(max(request.args.get("limit", 50, type=int) or 50, 1), 200)
     task_id = request.args.get("task_id", type=int)
     project_id = request.args.get("project_id", type=int)
     
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
     
-    query = "SELECT * FROM activity_logs WHERE 1=1"
-    params = []
+    query = "SELECT * FROM activity_logs WHERE user_id = %s"
+    params = [g.user_id]
     
     if task_id:
         query += " AND task_id = %s"
@@ -1392,7 +1502,7 @@ def get_activity_logs():
         query += " AND project_id = %s"
         params.append(project_id)
     
-    query += " ORDER BY created_at DESC LIMIT %s"
+    query += " ORDER BY created_at DESC, id DESC LIMIT %s"
     params.append(limit)
     
     cursor.execute(query, params)
@@ -1401,17 +1511,19 @@ def get_activity_logs():
     conn.close()
     return jsonify(logs), 200
 
-def log_activity(task_id, project_id, action, description, metadata=None):
+def log_activity(task_id, project_id, action, description, metadata=None, user_id=None):
     """Helper function to log activity.
 
     Never allowed to break the primary request - logging is best effort.
     """
     try:
+        if user_id is None:
+            user_id = getattr(g, "user_id", None)
         conn = get_connection()
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO activity_logs (task_id, project_id, action, description, metadata) VALUES (%s, %s, %s, %s, %s)",
-            (task_id, project_id, action, description, json.dumps(metadata) if metadata else None)
+            "INSERT INTO activity_logs (task_id, project_id, action, description, metadata, user_id) VALUES (%s, %s, %s, %s, %s, %s)",
+            (task_id, project_id, action, description, json.dumps(metadata) if metadata else None, user_id)
         )
         conn.commit()
         cursor.close()
@@ -1422,6 +1534,7 @@ def log_activity(task_id, project_id, action, description, metadata=None):
 # ==================== GLOBAL SEARCH ====================
 
 @app.route("/api/search", methods=["GET"])
+@require_auth
 def global_search():
     query = request.args.get("q", "").strip()
     if not query:
@@ -1435,14 +1548,15 @@ def global_search():
         cursor.execute("""
             SELECT id, title, description, status, priority, due_date, project_id, created_at
             FROM tasks
-            WHERE MATCH(title, description) AGAINST(%s IN NATURAL LANGUAGE MODE)
-            OR title LIKE %s
-            OR description LIKE %s
+            WHERE user_id = %s
+              AND (MATCH(title, description) AGAINST(%s IN NATURAL LANGUAGE MODE)
+                   OR title LIKE %s
+                   OR description LIKE %s)
             ORDER BY 
                 CASE WHEN MATCH(title, description) AGAINST(%s IN NATURAL LANGUAGE MODE) > 0 THEN 1 ELSE 2 END,
                 created_at DESC
             LIMIT 20
-        """, (query, f"%{query}%", f"%{query}%", query))
+        """, (g.user_id, query, f"%{query}%", f"%{query}%", query))
         tasks = cursor.fetchall()
     except Exception as e:
         # Fallback to LIKE query if FULLTEXT index not available
@@ -1450,20 +1564,20 @@ def global_search():
         cursor.execute("""
             SELECT id, title, description, status, priority, due_date, project_id, created_at
             FROM tasks
-            WHERE title LIKE %s OR description LIKE %s
+            WHERE user_id = %s AND (title LIKE %s OR description LIKE %s)
             ORDER BY created_at DESC
             LIMIT 20
-        """, (f"%{query}%", f"%{query}%"))
+        """, (g.user_id, f"%{query}%", f"%{query}%"))
         tasks = cursor.fetchall()
     
     # Search projects
     cursor.execute("""
         SELECT id, name, description, color, created_at
         FROM projects
-        WHERE name LIKE %s OR description LIKE %s
+        WHERE user_id = %s AND (name LIKE %s OR description LIKE %s)
         ORDER BY created_at DESC
         LIMIT 10
-    """, (f"%{query}%", f"%{query}%"))
+    """, (g.user_id, f"%{query}%", f"%{query}%"))
     projects = cursor.fetchall()
     
     # Search notes
@@ -1471,12 +1585,13 @@ def global_search():
         cursor.execute("""
             SELECT id, title, content, project_id, created_at, updated_at
             FROM notes
-            WHERE MATCH(title, content) AGAINST(%s IN NATURAL LANGUAGE MODE)
-            OR title LIKE %s
-            OR content LIKE %s
+            WHERE user_id = %s
+              AND (MATCH(title, content) AGAINST(%s IN NATURAL LANGUAGE MODE)
+                   OR title LIKE %s
+                   OR content LIKE %s)
             ORDER BY updated_at DESC
             LIMIT 20
-        """, (query, f"%{query}%", f"%{query}%"))
+        """, (g.user_id, query, f"%{query}%", f"%{query}%"))
         notes = cursor.fetchall()
     except Exception as e:
         # Fallback to LIKE query if FULLTEXT index not available
@@ -1484,10 +1599,10 @@ def global_search():
         cursor.execute("""
             SELECT id, title, content, project_id, created_at, updated_at
             FROM notes
-            WHERE title LIKE %s OR content LIKE %s
+            WHERE user_id = %s AND (title LIKE %s OR content LIKE %s)
             ORDER BY updated_at DESC
             LIMIT 20
-        """, (f"%{query}%", f"%{query}%"))
+        """, (g.user_id, f"%{query}%", f"%{query}%"))
         notes = cursor.fetchall()
     
     cursor.close()
@@ -1498,6 +1613,237 @@ def global_search():
         "projects": projects,
         "notes": notes
     }), 200
+
+# ==================== AUTH & ACCOUNT ====================
+
+def _public_user(user):
+    return {"id": user["id"], "name": user["name"], "email": user["email"]}
+
+
+@app.route("/api/auth/register", methods=["POST"])
+def register():
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    name = (data.get("name") or "").strip()
+    if not name or len(name) > 100:
+        return jsonify({"error": "Name is required (max 100 characters)"}), 400
+
+    email = validate_email(data.get("email"))
+    if not email:
+        return jsonify({"error": "A valid email address is required"}), 400
+
+    if len(data.get("password") or "") < 8:
+        return jsonify({"error": "Password must be at least 8 characters"}), 400
+
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT id FROM users WHERE email = %s", (email,))
+    if cursor.fetchone():
+        cursor.close()
+        conn.close()
+        return jsonify({"error": "An account with this email already exists"}), 409
+
+    password_hash = hash_password(data["password"])
+    cursor.execute(
+        "INSERT INTO users (name, email, password_hash) VALUES (%s, %s, %s)",
+        (name, email, password_hash),
+    )
+    conn.commit()
+    user_id = cursor.lastrowid
+    cursor.execute(
+        "INSERT INTO reminder_preferences (user_id, reminder_email) VALUES (%s, %s)",
+        (user_id, email),
+    )
+    conn.commit()
+    token = create_session(user_id, conn)
+    cursor.close()
+    conn.close()
+    return jsonify({"token": token, "user": {"id": user_id, "name": name, "email": email}}), 201
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def login():
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    email = validate_email(data.get("email"))
+    password = data.get("password") or ""
+    if not email or not password:
+        return jsonify({"error": "Email and password are required"}), 400
+
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT id, name, email, password_hash FROM users WHERE email = %s", (email,))
+    user = cursor.fetchone()
+    if not user or not verify_password(password, user["password_hash"]):
+        cursor.close()
+        conn.close()
+        return jsonify({"error": "Invalid email or password"}), 401
+
+    user.pop("password_hash", None)
+    token = create_session(user["id"], conn)
+    cursor.close()
+    conn.close()
+    return jsonify({"token": token, "user": _public_user(user)}), 200
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+@require_auth
+def logout():
+    auth_header = request.headers.get("Authorization", "")
+    raw_token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else None
+    revoke_session(raw_token)
+    return jsonify({"message": "Logged out"}), 200
+
+
+@app.route("/api/auth/me", methods=["GET"])
+@require_auth
+def me():
+    return jsonify({"user": {"id": g.user_id, "name": g.user_name, "email": g.user_email}}), 200
+
+
+REMINDER_SCHEDULE_LABEL = "Daily at 6:00 AM IST"
+
+
+def _preference_row(cursor, user_id):
+    """Return the stored preferences row for a user, or None if none exists."""
+    cursor.execute(
+        "SELECT enabled, reminder_email FROM reminder_preferences WHERE user_id = %s",
+        (user_id,),
+    )
+    return cursor.fetchone()
+
+
+def _preferences_for(cursor, user_id):
+    # The schedule is fixed for everyone: daily at 06:00 Asia/Kolkata. Only the
+    # on/off toggle and the destination address are user-controlled. Time and
+    # timezone are always reported as the fixed values, never from the row.
+    row = _preference_row(cursor, user_id)
+    if row:
+        return {
+            "enabled": bool(row["enabled"]),
+            "reminder_email": row["reminder_email"] or g.user_email,
+            "remind_time": reminders.DEFAULT_REMIND_TIME,
+            "timezone": reminders.DEFAULT_TIMEZONE,
+            "schedule_label": REMINDER_SCHEDULE_LABEL,
+        }
+    return {
+        "enabled": True,
+        "reminder_email": g.user_email,
+        "remind_time": reminders.DEFAULT_REMIND_TIME,
+        "timezone": reminders.DEFAULT_TIMEZONE,
+        "schedule_label": REMINDER_SCHEDULE_LABEL,
+    }
+
+
+@app.route("/api/auth/preferences", methods=["GET"])
+@require_auth
+def get_preferences():
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    preferences = _preferences_for(cursor, g.user_id)
+    cursor.close()
+    conn.close()
+    return jsonify(preferences), 200
+
+
+@app.route("/api/auth/preferences", methods=["PUT"])
+@require_auth
+def update_preferences():
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    # The reminder schedule is not configurable. Reject any attempt to move it
+    # instead of silently ignoring the input.
+    if data.get("remind_time") not in (None, ""):
+        if validate_remind_time(data.get("remind_time")) != reminders.DEFAULT_REMIND_TIME:
+            return jsonify({
+                "error": "Reminders are sent once a day at 06:00 Asia/Kolkata; custom times are not supported."
+            }), 400
+    if data.get("timezone") not in (None, ""):
+        if validate_timezone(data.get("timezone")) != reminders.DEFAULT_TIMEZONE:
+            return jsonify({
+                "error": "Reminders are sent at 06:00 Asia/Kolkata; custom timezones are not supported."
+            }), 400
+
+    # Validate a supplied email before touching the database so a bad value
+    # can never be partially applied.
+    raw_email = data.get("reminder_email")
+    normalized_email = None
+    if raw_email not in (None, ""):
+        normalized_email = validate_email(raw_email)
+        if not normalized_email:
+            return jsonify({"error": "Invalid reminder email address"}), 400
+
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    existing = _preference_row(cursor, g.user_id)
+
+    # Partial update: an omitted (or null/empty) field keeps its current value.
+    # Defaults apply only when the user has no preferences row yet.
+    raw_enabled = data.get("enabled")
+    if raw_enabled is None:
+        enabled = bool(existing["enabled"]) if existing else True
+    else:
+        enabled = bool(raw_enabled)
+
+    if normalized_email is not None:
+        reminder_email = normalized_email
+    elif existing:
+        reminder_email = existing["reminder_email"] or g.user_email
+    else:
+        reminder_email = g.user_email
+
+    cursor.execute(
+        """INSERT INTO reminder_preferences (user_id, enabled, remind_time, timezone, reminder_email)
+           VALUES (%s, %s, %s, %s, %s)
+           ON DUPLICATE KEY UPDATE
+             enabled = VALUES(enabled),
+             remind_time = VALUES(remind_time),
+             timezone = VALUES(timezone),
+             reminder_email = VALUES(reminder_email)""",
+        (
+            g.user_id,
+            int(enabled),
+            reminders.DEFAULT_REMIND_TIME,
+            reminders.DEFAULT_TIMEZONE,
+            reminder_email,
+        ),
+    )
+    conn.commit()
+    preferences = _preferences_for(cursor, g.user_id)
+    cursor.close()
+    conn.close()
+    return jsonify(preferences), 200
+
+
+# ==================== REMINDER HISTORY ====================
+
+@app.route("/api/reminders/history", methods=["GET"])
+@require_auth
+def get_reminder_history():
+    limit = min(max(request.args.get("limit", 30, type=int) or 30, 1), 100)
+    conn = get_connection()
+    history = reminders.get_reminder_history(conn, g.user_id, limit)
+    conn.close()
+    return jsonify(history), 200
+
+
+# ==================== INTERNAL JOBS ====================
+
+@app.route("/api/internal/send-daily-reminders", methods=["POST"])
+def internal_send_daily_reminders():
+    expected = os.getenv("REMINDER_JOB_TOKEN", "")
+    supplied = (request.headers.get("X-Reminder-Token") or "").strip()
+    if not expected or not hmac.compare_digest(expected, supplied):
+        return jsonify({"error": "Forbidden"}), 403
+    result = reminders.send_daily_reminders()
+    return jsonify(result), (200 if result.get("ok") else 503)
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)

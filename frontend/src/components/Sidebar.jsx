@@ -1,4 +1,11 @@
-export function Sidebar({ isOpen, onClose, onNavigate, currentPage }) {
+function getInitials(name) {
+  const parts = String(name || '').trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return '?';
+  if (parts.length === 1) return parts[0].charAt(0).toUpperCase();
+  return (parts[0].charAt(0) + parts[parts.length - 1].charAt(0)).toUpperCase();
+}
+
+export function Sidebar({ isOpen, onClose, onNavigate, currentPage, user = null }) {
   const navSections = [
     {
       label: 'NEXUS',
@@ -69,10 +76,10 @@ export function Sidebar({ isOpen, onClose, onNavigate, currentPage }) {
       <div className="sidebar-footer">
         {isOpen && (
           <div className="user-info">
-            <div className="avatar">U</div>
+            <div className="avatar">{getInitials(user?.name)}</div>
             <div className="user-details">
-              <span className="user-name">User</span>
-              <span className="user-role">Student</span>
+              <span className="user-name">{user?.name || 'Account'}</span>
+              <span className="user-role">{user?.email || 'Student'}</span>
             </div>
           </div>
         )}

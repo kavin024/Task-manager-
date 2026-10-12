@@ -9,8 +9,11 @@ import { FocusMode } from "./components/FocusMode"
 import { Analytics } from "./components/Analytics"
 import { Projects } from "./components/Projects"
 import { Notes } from "./components/Notes"
+import { AccountSettings } from "./components/AccountSettings"
+import { AuthScreen } from "./components/AuthScreen"
 import { CommandPalette, useCommandPalette } from "./components/CommandPalette"
 import { API, getErrorMessage } from "./services/api"
+import { useAuth } from "./context/AuthContext"
 import { useToast } from "./context/ToastContext"
 import { useTheme } from "./context/ThemeContext"
 
@@ -256,6 +259,7 @@ function PlaceholderPage({ title, description, icon }) {
 }
 
 export function App() {
+  const { user, initializing, logout } = useAuth()
   const [tasks, setTasks] = useState([])
   const [projects, setProjects] = useState([])
   const [loading, setLoading] = useState(true)
@@ -296,8 +300,19 @@ export function App() {
   }, [])
 
   useEffect(() => {
-    loadData()
-  }, [loadData])
+    if (user) loadData()
+  }, [user, loadData])
+
+  // Reset per-account UI state when the signed-in user changes.
+  useEffect(() => {
+    setTasks([])
+    setProjects([])
+    setEditing(null)
+    setDrawerTask(null)
+    setCurrentPage("dashboard")
+    setFilter("All")
+    setSearch("")
+  }, [user?.id])
 
   const handleNavigate = useCallback((page) => {
     setCurrentPage(page)
@@ -426,10 +441,23 @@ export function App() {
       case "notes":
         return <Notes projects={projects} dataVersion={dataVersion} />
       case "settings":
-        return <PlaceholderPage title="Settings" description="Configure your preferences" icon="⚙" />
+        return <AccountSettings />
       default:
         return <PlaceholderPage title="Page Not Found" description="This page doesn't exist yet" icon="🔍" />
     }
+  }
+
+  if (initializing) {
+    return (
+      <div className="app-loading">
+        <span className="app-loading-brand" aria-hidden="true">⚡</span>
+        <span className="auth-spinner" aria-label="Loading" />
+      </div>
+    )
+  }
+
+  if (!user) {
+    return <AuthScreen />
   }
 
   return (
@@ -438,6 +466,8 @@ export function App() {
       onNavigate={handleNavigate}
       mainRef={mainRef}
       onOpenSearch={() => setPaletteOpen(true)}
+      user={user}
+      onLogout={logout}
     >
       {renderPage()}
 

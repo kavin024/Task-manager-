@@ -2,7 +2,14 @@ import { useState, useRef, useEffect } from 'react';
 import { useTheme } from '../context/ThemeContext';
 import { useToast } from '../context/ToastContext';
 
-export function Topbar({ onMenuClick, onOpenSearch, isMobile = false, searchPlaceholder = "Search tasks, projects, notes..." }) {
+function getInitials(name) {
+  const parts = String(name || '').trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return '?';
+  if (parts.length === 1) return parts[0].charAt(0).toUpperCase();
+  return (parts[0].charAt(0) + parts[parts.length - 1].charAt(0)).toUpperCase();
+}
+
+export function Topbar({ onMenuClick, onOpenSearch, onNavigate, isMobile = false, searchPlaceholder = "Search tasks, projects, notes...", user = null, onLogout }) {
   const { theme, resolvedTheme, setTheme } = useTheme();
   const { toasts, hideToast } = useToast();
   const [themeMenuOpen, setThemeMenuOpen] = useState(false);
@@ -11,6 +18,10 @@ export function Topbar({ onMenuClick, onOpenSearch, isMobile = false, searchPlac
   const themeMenuRef = useRef(null);
   const notificationsRef = useRef(null);
   const userMenuRef = useRef(null);
+
+  const userInitials = getInitials(user?.name);
+  const displayName = user?.name || 'Account';
+  const displayEmail = user?.email || '';
 
   useEffect(() => {
     const handleClickOutside = (e) => {
@@ -173,8 +184,8 @@ export function Topbar({ onMenuClick, onOpenSearch, isMobile = false, searchPlac
             aria-expanded={userMenuOpen}
             aria-haspopup="true"
           >
-            <div className="avatar avatar-sm">U</div>
-            <span className="user-name">User</span>
+            <div className="avatar avatar-sm">{userInitials}</div>
+            <span className="user-name">{displayName}</span>
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
               <polyline points="6 9 12 15 18 9"></polyline>
             </svg>
@@ -182,10 +193,10 @@ export function Topbar({ onMenuClick, onOpenSearch, isMobile = false, searchPlac
           {userMenuOpen && (
             <div className="dropdown-menu" role="menu">
               <div className="user-menu-header">
-                <div className="avatar">U</div>
+                <div className="avatar">{userInitials}</div>
                 <div>
-                  <div className="user-name">User</div>
-                  <div className="user-email">student@example.com</div>
+                  <div className="user-name">{displayName}</div>
+                  <div className="user-email">{displayEmail}</div>
                 </div>
               </div>
               <div className="dropdown-divider"></div>
@@ -204,7 +215,11 @@ export function Topbar({ onMenuClick, onOpenSearch, isMobile = false, searchPlac
                 Settings
               </button>
               <div className="dropdown-divider"></div>
-              <button className="dropdown-item danger" role="menuitem">
+              <button
+                className="dropdown-item danger"
+                role="menuitem"
+                onClick={() => { setUserMenuOpen(false); onLogout?.(); }}
+              >
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
                   <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
                   <polyline points="16 17 21 12 16 7"></polyline>
